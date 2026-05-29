@@ -15,23 +15,43 @@ const typeDefs = `#graphql
   type ShardStats {
     totalCount: Int!
     averageGrade: Float!
+    timing: TimingDetails
   }
 
-  type Query {
-    # Fetch a paginated list of grades (Cursor-based pagination to protect server memory)
-    getGrades(limit: Int, nextCursor: String): GradeResponse!
-    
-    # Target analytics fetching optimized for our compound shard key
-    getDepartmentAnalytics(department: String!): ShardStats!
-    
-    # Specific student lookup matching full compound shard key
-    getStudentGrades(student_id: String!, department: String!): [GradeRecord!]!
+  type TimingDetails {
+    totalTimeMs: Float
+    dbQueryTimeMs: Float
+    cacheHit: Boolean
+  }
+
+  type QueryTiming {
+    textField: String
+    totalTimeMs: Float
+    dbQueryTimeMs: Float
+    cacheHit: Boolean
   }
 
   type GradeResponse {
     records: [GradeRecord!]!
     nextCursor: String
     hasMore: Boolean!
+    timing: QueryTiming
+  }
+
+  type Query {
+    getGrades(limit: Int, nextCursor: String): GradeResponse!
+    getDepartmentAnalytics(department: String!): ShardStats!
+    getStudentGrades(student_id: String!, department: String!): [GradeRecord!]!
+  }
+
+  # This is the missing piece Apollo is looking for!
+  type Mutation {
+    updateStudentGrade(
+      student_id: String!
+      department: String!
+      course_code: String!
+      newGrade: Float!
+    ): GradeRecord!
   }
 `;
 
