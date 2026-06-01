@@ -50,7 +50,7 @@ services:
       - shard2a
 
   # ------------------------------------------------------------------
-  # Redis Cache Server (Distributed Caching Layer)
+  # Redis Cache Server (New Distributed Caching Layer)
   # ------------------------------------------------------------------
   redis:
     image: redis:7-alpine

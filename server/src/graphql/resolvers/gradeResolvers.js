@@ -1,41 +1,18 @@
 // server/src/graphql/resolvers/gradeResolvers.js
 const { ObjectId } = require('mongodb');
-const { streamLogEvent } = require('../../kafka'); // Import our Kafka streaming helper
-
-// Helper function to handle the MongoDB Aggregation Pipeline cleanly
-async function fetchFromMongo(db, department) {
-  const pipeline = [
-    { $match: { department: department } },
-    {
-      $group: {
-        _id: "$department",
-        totalCount: { $sum: 1 },
-        averageGrade: { $avg: "$grade" }
-      }
-    }
-  ];
-
-  const result = await db.collection('grades').aggregate(pipeline).toArray();
-  
-  if (result.length === 0) {
-    return { totalCount: 0, averageGrade: 0.0 };
-  }
-
-  return {
-    totalCount: result[0].totalCount,
-    averageGrade: Math.round(result[0].averageGrade * 100) / 100
-  };
-}
+const { streamLogEvent } = require('../../kafka');
 
 const resolvers = {
   Query: {
     // 1. Paginated retrieval to cleanly handle large datasets safely
     getGrades: async (_, { limit = 20, nextCursor }, { db }) => {
+      const startTime = performance.now();
       const query = {};
       if (nextCursor) {
         query._id = { $lt: new ObjectId(nextCursor) };
       }
 
+      // Sort by descending ObjectId for predictable scrolling pagination
       const records = await db.collection('grades')
         .find(query)
         .sort({ _id: -1 })
@@ -43,41 +20,118 @@ const resolvers = {
         .toArray();
 
       const hasMore = records.length > limit;
-      if (hasMore) records.pop();
+      if (hasMore) records.pop(); // Remove extra record used for evaluation
 
       const nextCursorStr = hasMore ? records[records.length - 1]._id.toString() : null;
+      const endTime = performance.now();
+      const executionTime = (endTime - startTime).toFixed(2);
 
       return {
         records: records.map(r => ({ ...r, id: r._id.toString() })),
         nextCursor: nextCursorStr,
-        hasMore
+        hasMore,
+        timing: {
+          textField: "Total Time in Milliseconds",
+          totalTimeMs: parseFloat(executionTime), 
+          dbQueryTimeMs: parseFloat(executionTime),
+          cacheHit: false
+        }
       };
     },
 
     // 2. High-performance Cached & Targeted Shard Analytics Query
     getDepartmentAnalytics: async (_, { department }, { db, redis }) => {
+      const startTime = performance.now();
       const cacheKey = `analytics:dept:${department.toLowerCase().replace(/ /g, '_')}`;
 
       try {
-        if (!redis) {
-          console.log(`⚠️ Redis client is not initialized. Bypassing cache directly to Shards...`);
-          return await fetchFromMongo(db, department);
-        }
-
-        const cachedData = await redis.get(cacheKey);
-        if (cachedData) {
-          console.log(`🎯 Cache HIT for key: ${cacheKey}`);
-          return JSON.parse(cachedData);
+        // Step A: Check Redis Cache First
+        if (redis) {
+          const cachedData = await redis.get(cacheKey);
+          if (cachedData) {
+            console.log(`🎯 Cache HIT for key: ${cacheKey}`);
+            const cacheResult = JSON.parse(cachedData);
+            const endTime = performance.now();
+            return {
+              ...cacheResult,
+              timing: {
+                totalTimeMs: (endTime - startTime).toFixed(2),
+                dbQueryTimeMs: 0,
+                cacheHit: true
+              }
+            };
+          }
         }
 
         console.log(`❌ Cache MISS for key: ${cacheKey}. Querying MongoDB Shards...`);
-        const responseData = await fetchFromMongo(db, department);
 
-        await redis.setEx(cacheKey, 60, JSON.stringify(responseData));
-        return responseData;
+        // Step B: Fetch from MongoDB Shards on a Cache Miss
+        const queryStartTime = performance.now();
+        const pipeline = [
+          { $match: { department: department } },
+          {
+            $group: {
+              _id: "$department",
+              totalCount: { $sum: 1 },
+              averageGrade: { $avg: "$grade" }
+            }
+          }
+        ];
+
+        const result = await db.collection('grades').aggregate(pipeline).toArray();
+        const queryEndTime = performance.now();
+        
+        let responseData = { totalCount: 0, averageGrade: 0.0 };
+        if (result.length > 0) {
+          responseData = {
+            totalCount: result[0].totalCount,
+            averageGrade: Math.round(result[0].averageGrade * 100) / 100
+          };
+        }
+
+        // Step C: Save the result to Redis with an automatic 60-second expiration (TTL)
+        if (redis) {
+          await redis.setEx(cacheKey, 60, JSON.stringify(responseData));
+        }
+
+        const endTime = performance.now();
+        return {
+          ...responseData,
+          timing: {
+            totalTimeMs: (endTime - startTime).toFixed(2),
+            dbQueryTimeMs: (queryEndTime - queryStartTime).toFixed(2),
+            cacheHit: false
+          }
+        };
       } catch (error) {
         console.error('Redis Cache Error encountered:', error);
-        return await fetchFromMongo(db, department);
+        
+        const queryStartTime = performance.now();
+        const pipeline = [{ $match: { department } }, { $group: { _id: "$department", totalCount: { $sum: 1 }, averageGrade: { $avg: "$grade" } } }];
+        const result = await db.collection('grades').aggregate(pipeline).toArray();
+        const queryEndTime = performance.now();
+        const endTime = performance.now();
+        
+        if (result.length === 0) {
+          return {
+            totalCount: 0,
+            averageGrade: 0.0,
+            timing: {
+              totalTimeMs: (endTime - startTime).toFixed(2),
+              dbQueryTimeMs: (queryEndTime - queryStartTime).toFixed(2),
+              cacheHit: false
+            }
+          };
+        }
+        return {
+          totalCount: result[0].totalCount,
+          averageGrade: Math.round(result[0].averageGrade * 100) / 100,
+          timing: {
+            totalTimeMs: (endTime - startTime).toFixed(2),
+            dbQueryTimeMs: (queryEndTime - queryStartTime).toFixed(2),
+            cacheHit: false
+          }
+        };
       }
     },
 
@@ -90,38 +144,40 @@ const resolvers = {
     }
   },
 
+  // ------------------------------------------------------------------
+  // Added Mutation Block: Synchronized for Sharding, Cache, and Kafka
+  // ------------------------------------------------------------------
   Mutation: {
-    // 4. Real-time Grade Mutator with Cache Eviction and Kafka Broadcasting
     updateStudentGrade: async (_, { student_id, department, course_code, newGrade }, { db, redis }) => {
       console.log(`📝 Processing grade update request for Student: ${student_id} | Dept: ${department}`);
 
-      // Update the document inside the Sharded Cluster targeting compound keys
+      // 1. Update document in MongoDB (targets specific shard via compound shard key fields)
       const result = await db.collection('grades').findOneAndUpdate(
         { student_id, department, course_code },
         { 
           $set: { 
-            grade: newGrade,
+            grade: parseFloat(newGrade),
             updated_at: new Date().toISOString()
           } 
         },
-        { returnDocument: 'after' } 
+        { returnDocument: 'after' }
       );
 
-      // Handle raw MongoDB findOneAndUpdate differences across library updates
+      // Extract raw document reference across different mongodb driver iterations safely
       const updatedDocument = result.value || result;
 
       if (!updatedDocument) {
-        throw new Error(`Grade record matching Course Code ${course_code} for Student ${student_id} was not found.`);
+        throw new Error(`Grade record for course ${course_code} under Student ID ${student_id} was not found.`);
       }
 
-      // Cache Eviction (Wipe stale analytics from Redis memory)
+      // 2. Cache Eviction: Purge the department cache key from Redis to eliminate stale reads
       if (redis) {
         const cacheKey = `analytics:dept:${department.toLowerCase().replace(/ /g, '_')}`;
         await redis.del(cacheKey);
-        console.log(`🧹 Cache cleared for key: ${cacheKey} due to data mutation event.`);
+        console.log(`🧹 Cache cleared for key: ${cacheKey} due to update mutation.`);
       }
 
-      // Stream out to Apache Kafka Event Bus asynchronously
+      // 3. Event Streaming: Build structural payload and push out over Apache Kafka
       const cleanRecord = {
         ...updatedDocument,
         id: updatedDocument._id.toString()
