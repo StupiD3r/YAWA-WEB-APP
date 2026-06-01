@@ -24,7 +24,7 @@ const UserDashboard = ({ user, onLogout }) => {
       setError(null);
       
       // NOTE: Replace this URL with your actual backend server address if it is different!
-      fetch('http://localhost:5173/api/subjects') 
+      fetch('http://localhost:5000/api/subjects') 
         .then((res) => {
           if (!res.ok) throw new Error('Failed to fetch dataset from backend server.');
           return res.json();
